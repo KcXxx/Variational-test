@@ -1,0 +1,319 @@
+<!doctype html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>SpreadWatch Chart v2</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
+  <style>
+    :root{
+      --bg:#0b1220; --panel:#0f1a2e; --text:#e6eefc; --muted:#9fb3d9;
+      --border:#1f335a; --accent:#7aa2ff;
+    }
+    *{ box-sizing:border-box; }
+    body{
+      margin:0; font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "PingFang SC", "Hiragino Sans GB";
+      background:linear-gradient(180deg,#07101e 0%, #070c16 100%); color:var(--text);
+    }
+    .wrap{ max-width:1100px; margin:0 auto; padding:16px; }
+    .card{
+      background:rgba(15,26,46,.85); border:1px solid var(--border);
+      border-radius:14px; padding:14px; box-shadow: 0 10px 28px rgba(0,0,0,.25);
+    }
+    .topbar{
+      display:flex; gap:10px; flex-wrap:wrap; align-items:center; justify-content:space-between;
+      margin-bottom:12px;
+    }
+    .controls{ display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+    label{ font-size:12px; color:var(--muted); display:flex; gap:6px; align-items:center; }
+    select, button{
+      background:#0b1630; color:var(--text); border:1px solid var(--border);
+      border-radius:10px; padding:8px 10px; font-size:13px;
+      outline:none;
+    }
+    button{ cursor:pointer; }
+    button:hover{ border-color:#2f4d86; }
+    .stats{
+      display:flex; gap:14px; flex-wrap:wrap; justify-content:flex-end; align-items:center;
+      font-size:12px; color:var(--muted);
+    }
+    .pill{
+      padding:6px 10px; border:1px solid var(--border); border-radius:999px; background:#081326;
+    }
+    .pill b{ color:var(--text); font-weight:600; }
+    .chartbox{
+      height:420px; /* ✅ 固定高度，页面不再无限拉长 */
+      position:relative;
+    }
+    .footer{
+      margin-top:10px; font-size:12px; color:var(--muted);
+      display:flex; gap:10px; flex-wrap:wrap; justify-content:space-between;
+    }
+    .hint{ opacity:.9; }
+    .err{ color:#ffb4b4; }
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <div class="card">
+    <div class="topbar">
+      <div class="controls">
+        <label>币种
+          <select id="baseSelect"></select>
+        </label>
+
+        <label>窗口
+          <select id="windowSelect">
+            <option value="5m">最近 5 分钟</option>
+            <option value="30m">最近 30 分钟</option>
+            <option value="2h">最近 2 小时</option>
+          </select>
+        </label>
+
+        <label>指标
+          <select id="metricSelect">
+            <option value="bps">bps</option>
+            <option value="usd_price">usd_price（每 1 个币的价差）</option>
+            <option value="usd_cost">usd_cost（按 notional 折算成本）</option>
+          </select>
+        </label>
+
+        <label>notional
+          <select id="notionalSelect">
+            <option value="1500">1500</option>
+          </select>
+        </label>
+
+        <button id="refreshBtn">手动刷新</button>
+      </div>
+
+      <div class="stats">
+        <div class="pill">最新: <b id="latestVal">—</b></div>
+        <div class="pill">时间: <b id="latestTs">—</b></div>
+        <div class="pill">模式: <b>A1</b></div>
+      </div>
+    </div>
+
+    <div class="chartbox">
+      <canvas id="c"></canvas>
+    </div>
+
+    <div class="footer">
+      <div class="hint">提示：鼠标悬浮曲线可查看该时刻数值；滚轮可缩放，拖拽可平移（按住鼠标左键拖）。</div>
+      <div id="status" class="hint">状态：—</div>
+    </div>
+  </div>
+</div>
+
+<script>
+(() => {
+  const API_BASE = ""; // 同域（127.0.0.1:8000）托管时留空即可
+  const MODE = "lighter_mid_minus_var_sell"; // ✅ A1：lighter_mid - var_sell(=var_bid)
+
+  const baseSel = document.getElementById("baseSelect");
+  const windowSel = document.getElementById("windowSelect");
+  const metricSel = document.getElementById("metricSelect");
+  const notionalSel = document.getElementById("notionalSelect");
+  const refreshBtn = document.getElementById("refreshBtn");
+  const statusEl = document.getElementById("status");
+  const latestValEl = document.getElementById("latestVal");
+  const latestTsEl = document.getElementById("latestTs");
+
+  const fmtTs = (ms) => {
+    const d = new Date(ms);
+    const hh = String(d.getHours()).padStart(2,"0");
+    const mm = String(d.getMinutes()).padStart(2,"0");
+    const ss = String(d.getSeconds()).padStart(2,"0");
+    return `${hh}:${mm}:${ss}`;
+  };
+
+  const fmt = (x, kind) => {
+    if (x === null || x === undefined || !Number.isFinite(x)) return "—";
+    if (kind === "bps") return x.toFixed(3) + " bps";
+    if (kind === "usd_price") return x.toFixed(4) + " USD";
+    if (kind === "usd_cost") return x.toFixed(4) + " USD";
+    return String(x);
+  };
+
+  async function jget(path) {
+    const r = await fetch(API_BASE + path, { cache: "no-store" });
+    if (!r.ok) throw new Error(`HTTP ${r.status} ${path}`);
+    return await r.json();
+  }
+
+  async function selectActiveBase(base) {
+    // 告诉后端当前 active base，便于 active=2s 快刷
+    // 你后端已有这个接口（日志里见过 /api/chart/select）
+    await jget(`/api/chart/select?base=${encodeURIComponent(base)}`);
+  }
+
+  async function loadBases() {
+    // 只显示 active_bases / var_batch_keys 里的 bases（你后端现在返回 bases 这 17 个）
+    const j = await jget(`/api/bases`);
+    const bases = Array.isArray(j?.bases) ? j.bases : [];
+    baseSel.innerHTML = "";
+    for (const b of bases) {
+      const opt = document.createElement("option");
+      opt.value = b;
+      opt.textContent = b;
+      baseSel.appendChild(opt);
+    }
+
+    // 默认 BTC（如果存在）
+    if (bases.includes("BTC")) baseSel.value = "BTC";
+    else if (bases.length) baseSel.value = bases[0];
+  }
+
+  // 计算：bps -> usd_cost
+  function bpsToCost(bps, notionalUsd) {
+    // usd_cost ≈ notional * (bps / 10000)
+    return (bps / 10000.0) * notionalUsd;
+  }
+
+  // Chart.js setup
+  const ctx = document.getElementById("c");
+  const chart = new Chart(ctx, {
+    type: "line",
+    data: {
+      datasets: [{
+        label: "spread",
+        data: [],
+        borderWidth: 2,
+        pointRadius: 0,
+        tension: 0.15
+      }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false, // ✅ 固定高度
+      animation: false,
+      parsing: false,
+      normalized: true,
+      scales: {
+        x: {
+          type: "time",
+          time: { tooltipFormat: "HH:mm:ss" },
+          ticks: { color: "#9fb3d9" },
+          grid: { color: "rgba(159,179,217,.12)" }
+        },
+        y: {
+          ticks: { color: "#9fb3d9" },
+          grid: { color: "rgba(159,179,217,.12)" }
+        }
+      },
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          intersect: false,
+          mode: "index",
+          callbacks: {
+            title: (items) => {
+              if (!items?.length) return "";
+              return "时间: " + fmtTs(items[0].parsed.x);
+            },
+            label: (item) => {
+              const m = metricSel.value;
+              const v = item.parsed.y;
+              return "值: " + fmt(v, m);
+            }
+          }
+        }
+      }
+    }
+  });
+
+  let timer = null;
+
+  async function refresh() {
+    const base = baseSel.value;
+    const window = windowSel.value;
+    const metric = metricSel.value;
+    const notional = parseFloat(notionalSel.value || "1500");
+
+    if (!base) return;
+
+    statusEl.textContent = `状态：拉取 ${base} / ${window} / ${metric} ...`;
+
+    // 先设置 active base（后端采样器会更快）
+    try { await selectActiveBase(base); } catch (e) {}
+
+    // 我们固定用 bps 曲线作为“母数据”
+    const seriesBps = await jget(`/api/chart/series?base=${encodeURIComponent(base)}&window=${encodeURIComponent(window)}&metric=bps&mode=${encodeURIComponent(MODE)}`);
+
+    const pts = Array.isArray(seriesBps?.points) ? seriesBps.points : [];
+    const data = pts.map(p => ({ x: p.t, y: p.v }));
+
+    // metric=usd_price：如果你后端已有 metric=usd（或你后端实现了 usd_price），优先用后端
+    // 否则我们用 bps + latest mid 来“粗略换算”会不准，所以这里采用：如果后端没有 usd，就禁用该项并提示。
+    if (metric === "bps") {
+      chart.data.datasets[0].data = data;
+    } else if (metric === "usd_cost") {
+      chart.data.datasets[0].data = data.map(p => ({ x: p.x, y: bpsToCost(p.y, notional) }));
+    } else if (metric === "usd_price") {
+      // 尝试后端 metric=usd
+      let seriesUsd = null;
+      try {
+        seriesUsd = await jget(`/api/chart/series?base=${encodeURIComponent(base)}&window=${encodeURIComponent(window)}&metric=usd&mode=${encodeURIComponent(MODE)}`);
+      } catch (e) {
+        seriesUsd = null;
+      }
+      const ptsU = Array.isArray(seriesUsd?.points) ? seriesUsd.points : null;
+      if (!ptsU) {
+        statusEl.innerHTML = `状态：<span class="err">后端暂未提供 metric=usd 的曲线</span>（建议我帮你补一下后端的 usd 采样）`;
+        chart.data.datasets[0].data = [];
+        chart.update();
+        latestValEl.textContent = "—";
+        latestTsEl.textContent = "—";
+        return;
+      }
+      chart.data.datasets[0].data = ptsU.map(p => ({ x: p.t, y: p.v }));
+    }
+
+    chart.update();
+
+    // 更新 latest 显示（用当前 metric 口径）
+    if (data.length) {
+      const last = data[data.length - 1];
+      latestTsEl.textContent = fmtTs(last.x);
+      if (metric === "bps") latestValEl.textContent = fmt(last.y, "bps");
+      if (metric === "usd_cost") latestValEl.textContent = fmt(bpsToCost(last.y, notional), "usd_cost");
+      if (metric === "usd_price") {
+        // 如果用 usd_price，我们从图上拿最后一个点即可
+        const arr = chart.data.datasets[0].data;
+        const uLast = arr[arr.length - 1];
+        latestValEl.textContent = fmt(uLast?.y, "usd_price");
+      }
+    } else {
+      latestValEl.textContent = "—";
+      latestTsEl.textContent = "—";
+    }
+
+    statusEl.textContent = `状态：OK（点数 ${chart.data.datasets[0].data.length}）`;
+  }
+
+  function startTimer() {
+    if (timer) clearInterval(timer);
+    timer = setInterval(refresh, 2000); // ✅ 2s 刷新
+  }
+
+  // Events
+  refreshBtn.addEventListener("click", refresh);
+  baseSel.addEventListener("change", () => { refresh(); });
+  windowSel.addEventListener("change", () => { refresh(); });
+  metricSel.addEventListener("change", () => { refresh(); });
+
+  // Boot
+  (async () => {
+    try {
+      await loadBases();
+      await refresh();
+      startTimer();
+    } catch (e) {
+      statusEl.innerHTML = `状态：<span class="err">${String(e)}</span>`;
+    }
+  })();
+})();
+</script>
+</body>
+</html>

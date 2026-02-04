@@ -1,0 +1,322 @@
+<!doctype html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>SpreadWatch Pro (单币种)</title>
+
+  <style>
+    :root{
+      --bg:#0b0f16;
+      --panel:#0f1622;
+      --panel2:#121a26;
+      --border:#223149;
+      --text:#e8eefc;
+      --muted:#9bb0d0;
+      --green:#36c08a;
+      --red:#ff5a6b;
+    }
+    *{box-sizing:border-box;}
+    html,body{height:100%;}
+    body{
+      margin:0;
+      background: radial-gradient(1200px 800px at 20% 10%, rgba(54,192,138,0.08), transparent 40%),
+                  radial-gradient(900px 700px at 80% 20%, rgba(100,140,255,0.08), transparent 45%),
+                  var(--bg);
+      color:var(--text);
+      font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI",
+                   Roboto, Helvetica, Arial, "Apple Color Emoji","Segoe UI Emoji";
+    }
+    .wrap{max-width:1180px; margin:18px auto; padding:0 14px;}
+    .title{display:flex; align-items:flex-end; gap:10px; margin:6px 0 10px;}
+    .title h1{margin:0; font-size:20px; letter-spacing:.2px;}
+    .title .sub{color:var(--muted); font-size:12px; padding-bottom:2px;}
+
+    .toolbar{
+      background:linear-gradient(180deg, rgba(18,26,38,0.85), rgba(15,22,34,0.85));
+      border:1px solid var(--border);
+      border-radius:14px;
+      padding:10px 10px;
+      display:flex; flex-wrap:wrap; gap:10px; align-items:center;
+      backdrop-filter: blur(8px);
+    }
+    .ctrl{display:flex; align-items:center; gap:6px;}
+    label{color:var(--muted); font-size:12px;}
+    select,button{
+      background:rgba(15,22,34,0.95);
+      border:1px solid rgba(34,49,73,0.9);
+      color:var(--text);
+      border-radius:10px;
+      padding:7px 10px;
+      font-size:13px;
+      outline:none;
+    }
+    button{cursor:pointer;}
+    button:hover{border-color:#2f4568;}
+    .status{
+      margin-left:auto;
+      font-size:12px;
+      color:var(--muted);
+      padding-right:6px;
+      white-space:nowrap;
+    }
+    .card{
+      margin-top:12px;
+      background:linear-gradient(180deg, rgba(18,26,38,0.85), rgba(15,22,34,0.85));
+      border:1px solid var(--border);
+      border-radius:14px;
+      padding:12px;
+      backdrop-filter: blur(8px);
+    }
+    /* 关键：固定高度，避免页面被撑到无限长 */
+    .chartBox{
+      height:420px;
+      position:relative;
+    }
+    canvas{width:100% !important; height:100% !important;}
+    .hint{
+      margin-top:10px;
+      color:var(--muted);
+      font-size:12px;
+      line-height:1.45;
+    }
+    .pill{
+      display:inline-block;
+      padding:2px 8px;
+      border:1px solid rgba(34,49,73,0.9);
+      border-radius:999px;
+      margin-left:6px;
+      color:var(--muted);
+    }
+  </style>
+
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+</head>
+
+<body>
+<div class="wrap">
+  <div class="title">
+    <h1>SpreadWatch Pro（单币种）</h1>
+    <div class="sub">2 秒刷新｜支持负值｜hover 显示 bps/usd</div>
+  </div>
+
+  <div class="toolbar">
+    <div class="ctrl">
+      <label>币种</label>
+      <select id="baseSel"></select>
+    </div>
+
+    <div class="ctrl">
+      <label>时间窗口</label>
+      <select id="winSel">
+        <option value="5m">最近 5 分钟</option>
+        <option value="30m" selected>最近 30 分钟</option>
+        <option value="2h">最近 2 小时</option>
+      </select>
+    </div>
+
+    <div class="ctrl">
+      <label>指标</label>
+      <select id="metricSel">
+        <option value="bps" selected>bps</option>
+        <option value="usd">usd</option>
+      </select>
+    </div>
+
+    <div class="ctrl">
+      <label>模式</label>
+      <select id="modeSel">
+        <option value="lighter_bid_minus_var_sell" selected>lighter_bid - var_sell</option>
+        <option value="lighter_ask_minus_var_buy">lighter_ask - var_buy</option>
+      </select>
+    </div>
+
+    <button id="applyBtn">应用</button>
+
+    <div class="status" id="status">
+      未连接 <span class="pill" id="pill">loading</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="chartBox">
+      <canvas id="c"></canvas>
+    </div>
+    <div class="hint" id="hint">
+      如果币种下拉为空：说明后端还没收到该币种的 VAR quote（Tampermonkey 尚未 POST 成功）。
+    </div>
+  </div>
+</div>
+
+<script>
+const API = "http://127.0.0.1:8000";
+const NOTIONAL = 1500;
+const REFRESH_MS = 2000;
+
+function fmtTs(ms){
+  const d = new Date(ms);
+  const hh = String(d.getHours()).padStart(2,'0');
+  const mm = String(d.getMinutes()).padStart(2,'0');
+  const ss = String(d.getSeconds()).padStart(2,'0');
+  return `${hh}:${mm}:${ss}`;
+}
+
+async function jget(url){
+  const r = await fetch(url, {cache:"no-store"});
+  return await r.json();
+}
+
+function nice(v, digits){
+  if (v === null || v === undefined || !Number.isFinite(v)) return "null";
+  return Number(v).toFixed(digits);
+}
+
+// —— Chart.js 实例
+let chart = null;
+
+// 用于 tooltip 同时显示 bps/usd：我们每次 tick 同时拉两份 series（bps + usd），按时间戳合并
+function mergeByTs(pointsA, pointsB){
+  const map = new Map();
+  for(const p of (pointsA||[])) map.set(p.t, {t:p.t, bps:p.v});
+  for(const p of (pointsB||[])){
+    const o = map.get(p.t) || {t:p.t};
+    o.usd = p.v;
+    map.set(p.t, o);
+  }
+  return Array.from(map.values()).sort((x,y)=>x.t-y.t);
+}
+
+function makeChart(){
+  const ctx = document.getElementById("c");
+  chart = new Chart(ctx, {
+    type: "line",
+    data: {
+      labels: [],
+      datasets: [{
+        label: "spread",
+        data: [],
+        borderWidth: 2,
+        pointRadius: 0,
+        tension: 0.2,
+        // 关键：按正负分段着色（更像你给的案例）
+        segment: {
+          borderColor: ctx => (ctx.p0.parsed.y >= 0 ? "rgba(54,192,138,0.95)" : "rgba(255,90,107,0.95)")
+        }
+      }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: { mode: "nearest", intersect: false },
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          callbacks: {
+            title: (items) => items?.[0]?.label || "",
+            label: (item) => {
+              const meta = item.raw?.__meta;
+              if (!meta) return "";
+              const parts = [];
+              parts.push(`bps: ${nice(meta.bps, 4)}`);
+              parts.push(`usd: ${nice(meta.usd, 6)}`);
+              return parts;
+            }
+          }
+        }
+      },
+      scales: {
+        x: {
+          ticks: { color: "rgba(155,176,208,0.9)", maxRotation: 0 },
+          grid: { color: "rgba(34,49,73,0.35)" }
+        },
+        y: {
+          ticks: { color: "rgba(155,176,208,0.9)" },
+          grid: { color: "rgba(34,49,73,0.35)" }
+        }
+      }
+    }
+  });
+}
+
+async function refreshBases(){
+  const j = await jget(`${API}/api/chart/bases`);
+  const bases = (j && j.bases) ? j.bases : [];
+  const sel = document.getElementById("baseSel");
+  sel.innerHTML = "";
+
+  if (bases.length === 0){
+    // fallback：至少给个 BTC，避免页面炸掉
+    const opt = document.createElement("option");
+    opt.value = "BTC";
+    opt.textContent = "BTC";
+    sel.appendChild(opt);
+    return;
+  }
+
+  for(const b of bases){
+    const opt = document.createElement("option");
+    opt.value = b;
+    opt.textContent = b;
+    sel.appendChild(opt);
+  }
+}
+
+let timer = null;
+
+async function tick(){
+  const base = (document.getElementById("baseSel").value || "BTC").toUpperCase();
+  const win = document.getElementById("winSel").value;
+  const metric = document.getElementById("metricSel").value;
+  const mode = document.getElementById("modeSel").value;
+
+  // 1) 触发一次后端计算 + 采样（关键：让 series 有数据）
+  await jget(`${API}/api/markets?notional=${NOTIONAL}&bases=${encodeURIComponent(base)}&spread_mode=${encodeURIComponent(mode)}`);
+
+  // 2) 分别取 bps / usd 两条序列，并按时间戳合并（不改后端也能 hover 显示两个）
+  const sb = await jget(`${API}/api/chart/series?base=${encodeURIComponent(base)}&window=${encodeURIComponent(win)}&metric=bps`);
+  const su = await jget(`${API}/api/chart/series?base=${encodeURIComponent(base)}&window=${encodeURIComponent(win)}&metric=usd`);
+  const merged = mergeByTs(sb.points, su.points);
+
+  // 3) 画图：labels 取时间；data 取当前 metric；同时把 bps/usd 存到 __meta 供 tooltip 用
+  const labels = merged.map(p => fmtTs(p.t));
+  const data = merged.map(p => {
+    const v = (metric === "usd") ? p.usd : p.bps;
+    return { x: undefined, y: v, __meta: { bps: p.bps, usd: p.usd } };
+  });
+
+  chart.data.labels = labels;
+  chart.data.datasets[0].data = data;
+  chart.update("none");
+
+  // 4) 状态条（用 bps 的 latest 或 usd 的 latest 都行）
+  const status = document.getElementById("status");
+  const pill = document.getElementById("pill");
+  const latest = sb.latest || su.latest || null;
+  if (latest){
+    pill.textContent = `${base} | ${win} | ${mode}`;
+    status.firstChild.textContent = `在线`;
+  } else {
+    pill.textContent = `${base} | 暂无数据`;
+    status.firstChild.textContent = `等待数据`;
+  }
+}
+
+async function apply(){
+  if (timer) clearInterval(timer);
+
+  // bases 可能会变（你新增/减少脚本喂的币），所以每次应用先刷新
+  await refreshBases();
+
+  if (!chart) makeChart();
+  await tick();
+  timer = setInterval(() => tick().catch(()=>{}), REFRESH_MS);
+}
+
+document.getElementById("applyBtn").addEventListener("click", () => apply().catch(console.error));
+
+(async function boot(){
+  await apply();
+})();
+</script>
+</body>
+</html>

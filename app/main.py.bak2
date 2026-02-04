@@ -1,0 +1,262 @@
+import asyncio
+import time
+from app.feeds.lighter_ws import STATE as LIGHTER_WS_STATE
+from typing import Any, Dict, List, Optional, Tuple
+
+from fastapi import FastAPI, Query, Header, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+from app.state import STATE
+from app.feeds.lighter_markets import fetch_lighter_markets
+from app.feeds.lighter_ws import lighter_ws_loop
+
+
+app = FastAPI(title="Var-Lighter SpreadWatch (Browser Ingest)")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # local dashboard
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ----------------------------
+# In-memory store for Var quotes pushed from browser
+# var_quotes[base][notional] = (price, ts_ms)
+# ----------------------------
+VAR_QUOTES: Dict[str, Dict[float, Tuple[float, int]]] = {}
+VAR_TTL_MS = 60_000  # consider quotes stale after 60s
+
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def _safe_float(x) -> Optional[float]:
+    try:
+        if x is None:
+            return None
+        return float(x)
+    except Exception:
+        return None
+
+
+def _safe_int(x) -> Optional[int]:
+    try:
+        if x is None:
+            return None
+        return int(x)
+    except Exception:
+        return None
+
+
+def _compute_spread(var_buy: Optional[float], lighter_best_ask: Optional[float]) -> Dict[str, Optional[float]]:
+    if var_buy is None or lighter_best_ask is None:
+        return {"spread_usd": None, "spread_bps": None}
+    spread = var_buy - lighter_best_ask
+    if lighter_best_ask == 0:
+        return {"spread_usd": spread, "spread_bps": None}
+    bps = spread / lighter_best_ask * 10000.0
+    return {"spread_usd": spread, "spread_bps": bps}
+
+
+class VarQuoteIn(BaseModel):
+    base: str
+    notional_usd: float
+    buy_price: float
+    ts_ms: Optional[int] = None
+    source: Optional[str] = "tampermonkey"
+
+
+class VarQuoteBatchIn(BaseModel):
+    quotes: List[VarQuoteIn]
+
+
+def _ingest_one(q: VarQuoteIn):
+    base = q.base.upper().strip()
+    notional = float(q.notional_usd)
+    price = float(q.buy_price)
+    ts = int(q.ts_ms) if q.ts_ms is not None else _now_ms()
+
+    if base == "" or notional <= 0 or price <= 0:
+        return
+
+    by_notional = VAR_QUOTES.setdefault(base, {})
+    by_notional[notional] = (price, ts)
+
+
+def _get_var_price(base: str, notional: float) -> Optional[float]:
+    base = base.upper().strip()
+    by_notional = VAR_QUOTES.get(base)
+    if not by_notional:
+        return None
+    v = by_notional.get(float(notional))
+    if not v:
+        return None
+    price, ts = v
+    if _now_ms() - ts > VAR_TTL_MS:
+        return None
+    return price
+
+
+@app.on_event("startup")
+async def on_startup():
+    # Ensure STATE.markets exists
+    if not hasattr(STATE, "markets") or STATE.markets is None:
+        STATE.markets = {}
+
+    # Try fetch lighter markets (do NOT hard fail)
+    try:
+        markets = await fetch_lighter_markets()
+        print(f"[BOOT] fetched lighter markets: {len(markets)}")
+        for row in markets:
+            base = str(row.get("symbol", "")).upper().strip()
+            mid = _safe_int(row.get("market_id"))
+            if not base or mid is None:
+                continue
+
+            if base not in STATE.markets:
+                try:
+                    STATE.add_market(base=base, market_id=mid)  # optional
+                except Exception:
+                    STATE.markets[base] = {"base": base, "market_id": mid}
+
+            # attach market_id
+            try:
+                STATE.markets[base].market_id = mid  # type: ignore
+            except Exception:
+                try:
+                    STATE.markets[base]["market_id"] = mid  # type: ignore
+                except Exception:
+                    pass
+    except Exception as e:
+        print(f"[BOOT] WARNING: fetch_lighter_markets failed, continue startup. err={repr(e)}")
+
+    # Start Lighter WS loop
+    app.state.lighter_stop = asyncio.Event()
+    app.state.lighter_task = asyncio.create_task(lighter_ws_loop(app.state.lighter_stop))
+
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    try:
+        app.state.lighter_stop.set()
+    except Exception:
+        pass
+    try:
+        await asyncio.wait_for(app.state.lighter_task, timeout=10)
+    except Exception:
+        pass
+
+
+@app.get("/health")
+async def health():
+    markets_count = 0
+    try:
+        markets_count = len(getattr(STATE, "markets", {}) or {})
+    except Exception:
+        markets_count = 0
+
+    return {
+        "ok": True,
+        "tick_ms": getattr(STATE, "last_tick_ms", 0),
+        "markets": markets_count,
+        "var_quotes_bases": len(VAR_QUOTES),
+    }
+
+
+@app.post("/ingest/var")
+async def ingest_var_quote(
+    q: VarQuoteIn,
+    x_var_ingest_token: Optional[str] = Header(default=None),
+):
+    """
+    Browser pushes Var buy quote here.
+    Optional header token supported (set VAR_INGEST_TOKEN in script & backend if you want).
+    """
+    expected = None  # keep open by default
+    # If you want a token later, uncomment next 2 lines and set env:
+    # import os
+    # expected = os.getenv("VAR_INGEST_TOKEN")
+
+    if expected and x_var_ingest_token != expected:
+        raise HTTPException(status_code=401, detail="bad token")
+
+    _ingest_one(q)
+    return {"ok": True, "stored": {"base": q.base.upper(), "notional": q.notional_usd, "ts_ms": q.ts_ms}}
+
+
+@app.post("/ingest/var_batch")
+async def ingest_var_batch(
+    payload: VarQuoteBatchIn,
+    x_var_ingest_token: Optional[str] = Header(default=None),
+):
+    expected = None
+    # import os
+    # expected = os.getenv("VAR_INGEST_TOKEN")
+
+    if expected and x_var_ingest_token != expected:
+        raise HTTPException(status_code=401, detail="bad token")
+
+    for q in payload.quotes:
+        _ingest_one(q)
+    return {"ok": True, "count": len(payload.quotes)}
+
+
+@app.get("/api/markets")
+async def api_markets(
+    notional: float = Query(1500.0),
+    confirm: float = Query(3000.0),
+):
+    """
+    Return combined view:
+      - Lighter: best ask + volume (from WS)
+      - Var: buy quotes ingested from browser (notional & confirm)
+      - spread computed: var_buy(notional) - lighter_best_ask
+    """
+    out: List[Dict[str, Any]] = []
+    markets = getattr(STATE, "markets", {}) or {}
+
+    for base, m in markets.items():
+        if isinstance(m, dict):
+            market_id = _safe_int(m.get("market_id"))
+            lighter_best_ask = None
+            lighter_best_bid = None
+            lighter_vol = None
+        else:
+            market_id = _safe_int(getattr(m, "market_id", None))
+            book = getattr(m, "book", None)
+            lighter_best_ask = _safe_float(getattr(book, "best_ask", None)) if book else None
+            lighter_best_bid = _safe_float(getattr(book, "best_bid", None)) if book else None
+            stats = getattr(m, "stats", None)
+            lighter_vol = _safe_float(getattr(stats, "daily_quote_volume", None)) if stats else None
+
+        var_buy = _get_var_price(str(base), float(notional))
+        var_confirm = _get_var_price(str(base), float(confirm))
+
+        spread = _compute_spread(var_buy, lighter_best_ask)
+
+        out.append({
+            "base": str(base),
+            "lighter_market_id": market_id,
+            "lighter_best_ask": lighter_best_ask,
+            "lighter_best_bid": lighter_best_bid,
+            "lighter_daily_quote_volume": lighter_vol,
+            "var_buy_notional": var_buy,
+            "var_buy_confirm": var_confirm,
+            "spread_usd": spread["spread_usd"],
+            "spread_bps": spread["spread_bps"],
+        })
+
+    # sort: by volume desc, then spread_bps desc (absolute)
+    def _sort_key(x: Dict[str, Any]):
+        vol = x.get("lighter_daily_quote_volume")
+        vol = vol if isinstance(vol, (int, float)) else -1
+        bps = x.get("spread_bps")
+        abps = abs(bps) if isinstance(bps, (int, float)) else -1
+        return (vol, abps)
+
+    out.sort(key=_sort_key, reverse=True)
+    return out
